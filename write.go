@@ -23,6 +23,8 @@ func SetData(data map[string]any) {
 func (c *Config) SetData(data map[string]any) {
 	_ = c.writeAndHook(OnSetData, func() error {
 		c.data = data
+		// every value of the replaced data is owned by the runtime
+		c.sources = tagSourceRoot(data, SourceRuntime)
 		return nil
 	})
 }
@@ -51,18 +53,28 @@ func (c *Config) Set(key string, val any, setByPath ...bool) (err error) {
 
 // setValue set the value to data by key. the c.lock must be locked by the caller.
 func (c *Config) setValue(key string, val any, sep byte, setByPath []bool) error {
+	// the new value, including its sub-nodes when it is a container, is owned
+	// by the runtime
+	mark := tagSources(val, SourceRuntime)
+
 	if strings.IndexByte(key, sep) == -1 {
 		c.data[key] = val
+		c.sources[key] = mark
 		return nil
 	}
 
 	// disable set by path.
 	if len(setByPath) > 0 && !setByPath[0] {
 		c.data[key] = val
+		c.sources[key] = mark
 		return nil
 	}
 
-	// set by path
+	// set by path, mirror the changed path in the provenance tree so that
+	// sibling keys keep their original source.
 	keys := strings.Split(key, string(sep))
-	return maputil.SetByKeys(&c.data, keys, val)
+	if err := maputil.SetByKeys(&c.data, keys, val); err != nil {
+		return err
+	}
+	return setSourceByKeys(&c.sources, keys, mark)
 }

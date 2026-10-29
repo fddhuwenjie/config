@@ -87,14 +87,16 @@ type Config struct {
 	opts *Options
 	// all config data
 	data map[string]any
+	// sources mirrors data with the source marker (file absolute path or
+	// SourceRuntime) of every node, see Config.SourceOf
+	sources map[string]any
 
 	// loaded config files records
 	loadedUrls  []string
 	loadedFiles []string
 	driverNames []string
 	// driver alias to name map.
-	aliasMap  map[string]string
-	reloading bool
+	aliasMap map[string]string
 
 	// TODO Deprecated decoder and encoder, use driver instead
 	// drivers map[string]Driver
@@ -135,9 +137,10 @@ func NewGeneric(name string, opts ...OptionFn) *Config {
 // NewEmpty create config instance with custom options
 func NewEmpty(name string, opts ...OptionFn) *Config {
 	c := &Config{
-		name: name,
-		opts: newDefaultOption(),
-		data: make(map[string]any),
+		name:    name,
+		opts:    newDefaultOption(),
+		data:    make(map[string]any),
+		sources: make(map[string]any),
 		// don't add any drivers
 		encoders: map[string]Encoder{},
 		decoders: map[string]Decoder{},
@@ -279,6 +282,7 @@ func (c *Config) ClearAll() {
 func (c *Config) ClearData() {
 	_ = c.writeAndHook(OnCleanData, func() error {
 		c.data = make(map[string]any)
+		c.sources = make(map[string]any)
 		c.loadedUrls = []string{}
 		c.loadedFiles = []string{}
 		return nil
@@ -317,7 +321,11 @@ func (c *Config) writeAndHook(hookName string, fn func() error) error {
 	c.ClearCaches()
 	c.lock.Unlock()
 
-	c.fireHook(hookName)
+	// only a successful change is published, a failed load must not fire the
+	// success event.
+	if err == nil {
+		c.fireHook(hookName)
+	}
 	return err
 }
 

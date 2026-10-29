@@ -20,6 +20,11 @@ import (
 
 // LoadFiles load one or multi files, will fire OnLoadData event
 //
+// The files of one call are loaded as a single consistent batch: the values,
+// their sources and the loaded files records are published together only when
+// every file was read and parsed successfully, otherwise the previous state is
+// kept and the OnLoadData event is not fired.
+//
 // Usage:
 //
 //	config.LoadFiles(file1, file2, ...)
@@ -28,18 +33,8 @@ func LoadFiles(sourceFiles ...string) error { return dc.LoadFiles(sourceFiles...
 // LoadFiles load and parse config files, will fire OnLoadData event
 func (c *Config) LoadFiles(sourceFiles ...string) error {
 	return c.writeAndHook(OnLoadData, func() error {
-		return c.loadFiles(sourceFiles)
+		return c.stageLoadedFiles(sourceFiles, nil, false)
 	})
-}
-
-// loadFiles load and parse config files, the caller must hold the data lock.
-func (c *Config) loadFiles(sourceFiles []string) (err error) {
-	for _, file := range sourceFiles {
-		if err = c.loadFile(file, false, ""); err != nil {
-			return
-		}
-	}
-	return
 }
 
 // LoadExists load one or multi files, will ignore not exist
@@ -50,18 +45,18 @@ func (c *Config) loadFiles(sourceFiles []string) (err error) {
 func LoadExists(sourceFiles ...string) error { return dc.LoadExists(sourceFiles...) }
 
 // LoadExists load and parse config files, but will ignore not exists file.
+//
+// As LoadFiles, the existing files are loaded as a single consistent batch.
 func (c *Config) LoadExists(sourceFiles ...string) error {
 	return c.writeAndHook(OnLoadData, func() error {
+		files := make([]string, 0, len(sourceFiles))
 		for _, file := range sourceFiles {
 			if file == "" {
 				continue
 			}
-
-			if err := c.loadFile(file, true, ""); err != nil {
-				return err
-			}
+			files = append(files, file)
 		}
-		return nil
+		return c.stageLoadedFiles(files, nil, true)
 	})
 }
 
@@ -95,12 +90,7 @@ func (c *Config) LoadFilesByFilter(configFiles []string, filter FileFilterFn) er
 	}
 
 	return c.writeAndHook(OnLoadData, func() error {
-		for i, file := range loadFiles {
-			if err := c.loadFile(file, false, formats[i]); err != nil {
-				return err
-			}
-		}
-		return nil
+		return c.stageLoadedFiles(loadFiles, formats, false)
 	})
 }
 
@@ -133,7 +123,8 @@ func (c *Config) LoadRemote(format, url string) (err error) {
 	}
 
 	return c.writeAndHook(OnLoadData, func() error {
-		if err := c.parseSourceCode(format, bts); err != nil {
+		// the remote URL is the source of its values, see Config.SourceOf
+		if err := c.parseSourceCode(format, bts, url); err != nil {
 			return err
 		}
 		c.loadedUrls = append(c.loadedUrls, url)
@@ -300,6 +291,11 @@ func (c *Config) LoadData(dataSources ...any) (err error) {
 			if err := mergo.Merge(&c.data, ds, c.opts.MergeOptions...); err != nil {
 				return errorx.WithStack(err)
 			}
+
+			// data provided programmatically is owned by the runtime
+			if dm, ok := ds.(map[string]any); ok {
+				mergeSourceRoot(c.sources, tagSourceRoot(dm, SourceRuntime), c.sourceMergeFlags())
+			}
 		}
 		return nil
 	})
@@ -317,6 +313,7 @@ func (c *Config) LoadSMap(smp map[string]string) {
 func (c *Config) loadSMap(smp map[string]string) {
 	for k, v := range smp {
 		c.data[k] = v
+		c.sources[k] = &sourceNode{tag: SourceRuntime}
 	}
 }
 
@@ -337,12 +334,12 @@ func LoadSources(format string, src []byte, more ...[]byte) error {
 // `))
 func (c *Config) LoadSources(format string, src []byte, more ...[]byte) (err error) {
 	return c.writeAndHook(OnLoadData, func() error {
-		if err := c.parseSourceCode(format, src); err != nil {
+		if err := c.parseSourceCode(format, src, SourceRuntime); err != nil {
 			return err
 		}
 
 		for _, sc := range more {
-			if err := c.parseSourceCode(format, sc); err != nil {
+			if err := c.parseSourceCode(format, sc, SourceRuntime); err != nil {
 				return err
 			}
 		}
@@ -358,12 +355,12 @@ func LoadStrings(format string, str string, more ...string) error {
 // LoadStrings load data from source string content.
 func (c *Config) LoadStrings(format string, str string, more ...string) (err error) {
 	return c.writeAndHook(OnLoadData, func() error {
-		if err := c.parseSourceCode(format, []byte(str)); err != nil {
+		if err := c.parseSourceCode(format, []byte(str), SourceRuntime); err != nil {
 			return err
 		}
 
 		for _, s := range more {
-			if err := c.parseSourceCode(format, []byte(s)); err != nil {
+			if err := c.parseSourceCode(format, []byte(s), SourceRuntime); err != nil {
 				return err
 			}
 		}
@@ -379,12 +376,7 @@ func LoadFilesByFormat(format string, configFiles ...string) error {
 // LoadFilesByFormat load one or multi files by give format, will fire OnLoadData event
 func (c *Config) LoadFilesByFormat(format string, configFiles ...string) error {
 	return c.writeAndHook(OnLoadData, func() error {
-		for _, file := range configFiles {
-			if err := c.loadFile(file, false, format); err != nil {
-				return err
-			}
-		}
-		return nil
+		return c.stageLoadedFiles(configFiles, repeatFormat(format, len(configFiles)), false)
 	})
 }
 
@@ -396,13 +388,18 @@ func LoadExistsByFormat(format string, configFiles ...string) error {
 // LoadExistsByFormat load one or multi files by give format, will fire OnLoadData event
 func (c *Config) LoadExistsByFormat(format string, configFiles ...string) error {
 	return c.writeAndHook(OnLoadData, func() error {
-		for _, file := range configFiles {
-			if err := c.loadFile(file, true, format); err != nil {
-				return err
-			}
-		}
-		return nil
+		return c.stageLoadedFiles(configFiles, repeatFormat(format, len(configFiles)), true)
 	})
+}
+
+// repeatFormat builds a formats slice of length n filled with format, it pairs
+// with Config.stageLoadedFiles.
+func repeatFormat(format string, n int) []string {
+	formats := make([]string, n)
+	for i := range formats {
+		formats[i] = format
+	}
+	return formats
 }
 
 // LoadOptions for load config from dir.
@@ -489,7 +486,7 @@ func (c *Config) LoadFromDir(dirPath, format string, loFns ...LoadOptFn) (err er
 	}
 
 	return c.writeAndHook(OnLoadData, func() error {
-		return c.loadDataMap(dirData)
+		return c.loadDataMap(dirData, SourceRuntime)
 	})
 }
 
@@ -497,6 +494,11 @@ func (c *Config) LoadFromDir(dirPath, format string, loFns ...LoadOptFn) (err er
 func ReloadFiles() error { return dc.ReloadFiles() }
 
 // ReloadFiles reload config data use loaded files. use on watching loaded files change
+//
+// The values, their sources and the loaded files records are published as one
+// consistent state: on any file read or parse error the previous successful
+// state is kept, the OnReloadData event is not fired, and keys removed from the
+// files leave no data and no provenance behind after a successful reload.
 func (c *Config) ReloadFiles() (err error) {
 	files := c.loadedFiles
 	if len(files) == 0 {
@@ -508,17 +510,37 @@ func (c *Config) ReloadFiles() (err error) {
 	c.hookMu.Lock()
 	defer c.hookMu.Unlock()
 
-	var bakData map[string]any
 	c.lock.Lock()
-	c.reloading = true
-	bakData = c.data
-	c.data = make(map[string]any)
+	bakData := c.data
+	bakSources := c.sources
 
-	err = c.loadFiles(files)
-	c.reloading = false
+	stageData := make(map[string]any)
+	stageSources := make(map[string]any)
+	flags := c.sourceMergeFlags()
+
+	for _, file := range files {
+		data, _, skipped, rErr := c.readLoadFile(file, "", false)
+		if rErr != nil {
+			err = rErr
+			break
+		}
+		if skipped {
+			continue
+		}
+		if mErr := mergo.Merge(&stageData, data, c.opts.MergeOptions...); mErr != nil {
+			err = errorx.WithStack(mErr)
+			break
+		}
+		// the records are absolute paths, use the record itself as the tag
+		mergeSourceRoot(stageSources, tagSourceRoot(data, file), flags)
+	}
 	if err != nil {
-		// revert to the back up data on error
+		// revert to the back up state on error
 		c.data = bakData
+		c.sources = bakSources
+	} else {
+		c.data = stageData
+		c.sources = stageSources
 	}
 	c.ClearCaches()
 	c.lock.Unlock()
@@ -529,62 +551,107 @@ func (c *Config) ReloadFiles() (err error) {
 	return
 }
 
-// load config file, will fire OnLoadData event
-//   - loadExist=false will return error on file not exists
-//   - the caller must hold the data lock.
-func (c *Config) loadFile(file string, loadExist bool, format string) (err error) {
+// stageLoadedFiles reads, parses and merges the given files into staging copies
+// of the current state, and publishes data, provenance and loaded files records
+// together only when the whole batch succeeded. Any read/parse/merge error keeps
+// the previous successful state untouched. the caller must hold the data lock.
+//
+//   - formats may be nil, the format is then detected by the file extension.
+//   - ignoreMissing skips files that do not exist (LoadExists).
+func (c *Config) stageLoadedFiles(files []string, formats []string, ignoreMissing bool) error {
+	stageData := deepCopyDataMap(c.data)
+	stageSources := deepCopySourceRoot(c.sources)
+	flags := c.sourceMergeFlags()
+
+	addedRecords := make([]string, 0, len(files))
+	for i, file := range files {
+		format := ""
+		if formats != nil {
+			format = formats[i]
+		}
+
+		data, tag, skipped, err := c.readLoadFile(file, format, ignoreMissing)
+		if err != nil {
+			return err
+		}
+		if skipped {
+			continue
+		}
+
+		if err := mergo.Merge(&stageData, data, c.opts.MergeOptions...); err != nil {
+			return errorx.WithStack(err)
+		}
+		mergeSourceRoot(stageSources, tagSourceRoot(data, tag), flags)
+		addedRecords = append(addedRecords, tag)
+	}
+
+	// publish the consistent state
+	c.data = stageData
+	c.sources = stageSources
+	c.loadedFiles = append(c.loadedFiles, addedRecords...)
+	return nil
+}
+
+// readLoadFile opens and parses one config file. the caller must hold the data
+// lock. It returns:
+//   - skipped=true when the file does not exist and ignoreMissing is true;
+//   - data and tag (the file absolute path) on success.
+func (c *Config) readLoadFile(file string, format string, ignoreMissing bool) (data map[string]any, tag string, skipped bool, err error) {
 	fd, err := os.Open(file)
 	if err != nil {
 		// skip not exist file
-		if os.IsNotExist(err) && loadExist {
-			return nil
+		if os.IsNotExist(err) && ignoreMissing {
+			return nil, "", true, nil
 		}
-		return err
+		return nil, "", false, err
 	}
 	//noinspection GoUnhandledErrorResult
 	defer fd.Close()
 
 	// read file content
 	bts, err := io.ReadAll(fd)
-	if err == nil {
-		// get format for file ext
-		if format == "" {
-			format = strings.Trim(filepath.Ext(file), ".")
-		}
-
-		// parse file content
-		if err = c.parseSourceCode(format, bts); err != nil {
-			return
-		}
-
-		if !c.reloading {
-			c.loadedFiles = append(c.loadedFiles, file)
-		}
+	if err != nil {
+		return nil, "", false, err
 	}
-	return
+
+	// get format for file ext
+	if format == "" {
+		format = strings.Trim(filepath.Ext(file), ".")
+	}
+
+	data, err = c.parseSourceToMap(format, bts)
+	if err != nil {
+		return nil, "", false, err
+	}
+	return data, absFilePath(file), false, nil
+}
+
+// absFilePath resolves the absolute source path of a loaded file.
+func absFilePath(file string) string {
+	if abs, err := filepath.Abs(file); err == nil {
+		return abs
+	}
+	return file
 }
 
 // parse config source code to Config. the caller must hold the data lock.
-func (c *Config) parseSourceCode(format string, blob []byte) (err error) {
+func (c *Config) parseSourceCode(format string, blob []byte, tag string) (err error) {
 	data, err := c.parseSourceToMap(format, blob)
 	if err != nil {
 		return err
 	}
 
-	return c.loadDataMap(data)
+	return c.loadDataMap(data, tag)
 }
 
-// loadDataMap merge the data map to config data. the caller must hold the data lock,
-// and fire the OnLoadData event by itself.
-func (c *Config) loadDataMap(data map[string]any) (err error) {
-	// first: init config data
-	if len(c.data) == 0 {
-		c.data = data
-	} else {
-		// again ... will merge data
-		err = mergo.Merge(&c.data, data, c.opts.MergeOptions...)
+// loadDataMap merge the data map to config data, tagging every node with tag.
+// the caller must hold the data lock, and fire the OnLoadData event by itself.
+func (c *Config) loadDataMap(data map[string]any, tag string) (err error) {
+	if err = mergo.Merge(&c.data, data, c.opts.MergeOptions...); err != nil {
+		return errorx.WithStack(err)
 	}
-	return err
+	mergeSourceRoot(c.sources, tagSourceRoot(data, tag), c.sourceMergeFlags())
+	return nil
 }
 
 // parse config source code to Config.
